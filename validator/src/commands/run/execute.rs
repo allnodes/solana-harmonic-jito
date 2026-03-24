@@ -5,6 +5,7 @@ use {
         cli::{self},
         commands::{FromClapArgMatches, run::args::RunArgs},
         ledger_lockfile, lock_ledger,
+        shred_receiver_addresses::parse_shred_receiver_addresses,
     },
     agave_snapshots::{
         ArchiveFormat, SnapshotInterval, SnapshotVersion,
@@ -779,6 +780,24 @@ pub fn execute(
              snapshot generation are disabled"
         );
     }
+    let shred_receiver_addresses = Arc::new(ArcSwap::from_pointee(
+        parse_shred_receiver_addresses(
+            matches
+                .values_of("shred_receiver_address")
+                .into_iter()
+                .flatten(),
+        )
+        .map_err(|err| format!("invalid shred_receiver_address: {err}"))?,
+    ));
+    let shred_retransmit_receiver_addresses = Arc::new(ArcSwap::from_pointee(
+        parse_shred_receiver_addresses(
+            matches
+                .values_of("shred_retransmit_receiver_address")
+                .into_iter()
+                .flatten(),
+        )
+        .map_err(|err| format!("invalid shred_retransmit_receiver_address: {err}"))?,
+    ));
 
     let mut validator_config = ValidatorConfig {
         log_config,
@@ -908,6 +927,8 @@ pub fn execute(
             "snapshot_packager_niceness_adj",
             i8
         ),
+        shred_receiver_addresses: shred_receiver_addresses.clone(),
+        shred_retransmit_receiver_addresses: shred_retransmit_receiver_addresses.clone(),
     };
     validator_config
         .block_production_method

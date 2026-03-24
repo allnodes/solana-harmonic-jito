@@ -27,6 +27,7 @@ use {
     agave_votor::{event::VotorEventSender, slot_clock::SharedAlpenglowSlotClock},
     agave_votor_messages::VerifiedVoterSlotsSender,
     agave_xdp::transmitter::XdpSender,
+    arc_swap::ArcSwap,
     crossbeam_channel::{Receiver, bounded, unbounded},
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
@@ -57,7 +58,7 @@ use {
         streamer::StakedNodes,
     },
     solana_turbine::{
-        XdpSender as TurbineXdpSender,
+        ShredReceiverAddresses, XdpSender as TurbineXdpSender,
         broadcast_stage::{BroadcastStage, BroadcastStageType},
     },
     std::{
@@ -164,6 +165,7 @@ impl Tpu {
         scheduler_bindings: Option<(PathBuf, mpsc::Sender<BankingControlMsg>)>,
         cancel: CancellationToken,
         votor_event_sender: VotorEventSender,
+        shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
     ) -> Self {
         let TpuSockets {
             vote: tpu_vote_sockets,
@@ -372,6 +374,7 @@ impl Tpu {
             shred_version,
             turbine_xdp_sender,
             votor_event_sender,
+            shred_receiver_addresses,
         );
 
         let mut key_notifiers = key_notifiers.write().unwrap();

@@ -149,7 +149,7 @@ use {
     },
     solana_time_utils::timestamp,
     solana_tpu_client::tpu_client::{DEFAULT_TPU_CONNECTION_POOL_SIZE, DEFAULT_VOTE_USE_QUIC},
-    solana_turbine::{self, broadcast_stage::BroadcastStageType},
+    solana_turbine::{self, ShredReceiverAddresses, broadcast_stage::BroadcastStageType},
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     solana_validator_exit::Exit,
     solana_vote_program::vote_state::{VoteStateV4, handler::VoteStateHandler},
@@ -408,6 +408,10 @@ pub struct ValidatorConfig {
     pub repair_handler_type: RepairHandlerType,
     // Thread niceness adjustment for snapshot packager service
     pub snapshot_packager_niceness_adj: i8,
+    /// Addresses to forward leader shreds to
+    pub shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
+    /// Addresses to forward retransmit shreds to
+    pub shred_retransmit_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
 }
 
 impl ValidatorConfig {
@@ -493,6 +497,12 @@ impl ValidatorConfig {
             delay_leader_block_for_pending_fork: true,
             repair_handler_type: RepairHandlerType::default(),
             snapshot_packager_niceness_adj: 0,
+            shred_receiver_addresses: Arc::new(
+                ArcSwap::from_pointee(ShredReceiverAddresses::new()),
+            ),
+            shred_retransmit_receiver_addresses: Arc::new(ArcSwap::from_pointee(
+                ShredReceiverAddresses::new(),
+            )),
         }
     }
 
@@ -1737,6 +1747,7 @@ impl Validator {
                 highest_finalized,
             },
             reward_aggregates_sender,
+            config.shred_retransmit_receiver_addresses.clone(),
         )
         .map_err(ValidatorError::Other)?;
 
@@ -1815,6 +1826,7 @@ impl Validator {
             }),
             cancel,
             votor_event_sender.clone(),
+            config.shred_receiver_addresses.clone(),
         );
 
         datapoint_info!(
@@ -1849,6 +1861,8 @@ impl Validator {
             snapshot_controller,
             blockstore: blockstore.clone(),
             votor_event_sender,
+            shred_receiver_addresses: config.shred_receiver_addresses.clone(),
+            shred_retransmit_receiver_addresses: config.shred_retransmit_receiver_addresses.clone(),
         });
 
         Ok(Self {
