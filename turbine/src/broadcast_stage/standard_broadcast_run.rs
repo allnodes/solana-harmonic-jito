@@ -335,7 +335,13 @@ impl StandardBroadcastRun {
             &mut ProcessShredsStats::default(),
         )?;
         // Data and coding shreds are sent in a single batch.
-        let _ = self.transmit(&srecv, cluster_info, BroadcastSocket::Udp(sock), bank_forks);
+        let _ = self.transmit(
+            &srecv,
+            cluster_info,
+            BroadcastSocket::Udp(sock),
+            bank_forks,
+            &ShredReceiverAddresses::new(),
+        );
         let _ = self.record(&brecv, blockstore, &mut pinnable_slice, &mut write_batch);
         Ok(())
     }
@@ -584,6 +590,7 @@ impl StandardBroadcastRun {
         shreds: Arc<Vec<Shred>>,
         broadcast_shred_batch_info: Option<BroadcastShredBatchInfo>,
         bank_forks: &RwLock<BankForks>,
+        shred_receiver_addresses: &ShredReceiverAddresses,
     ) -> Result<()> {
         trace!("Broadcasting {:?} shreds", shreds.len());
         let mut transmit_stats = TransmitShredsStats {
@@ -605,6 +612,7 @@ impl StandardBroadcastRun {
             bank_forks,
             &self.leader_schedule_cache,
             cluster_info.socket_addr_space(),
+            shred_receiver_addresses,
         )?;
         transmit_time.stop();
 
@@ -675,9 +683,17 @@ impl BroadcastRun for StandardBroadcastRun {
         cluster_info: &ClusterInfo,
         sock: BroadcastSocket,
         bank_forks: &RwLock<BankForks>,
+        shred_receiver_addresses: &ShredReceiverAddresses,
     ) -> Result<()> {
         let (shreds, batch_info) = receiver.recv()?;
-        self.broadcast(sock, cluster_info, shreds, batch_info, bank_forks)
+        self.broadcast(
+            sock,
+            cluster_info,
+            shreds,
+            batch_info,
+            bank_forks,
+            shred_receiver_addresses,
+        )
     }
     fn record<'db>(
         &mut self,
