@@ -36,6 +36,7 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("solProgTrker".to_string())
         .spawn(move || {
+            solana_metrics::mark_thread_nonfatal();
             ProgressTracker::new(
                 exit,
                 shared_leader_state,
