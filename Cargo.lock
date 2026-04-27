@@ -6054,6 +6054,13 @@ name = "rbpf-cli"
 version = "4.2.1"
 
 [[package]]
+name = "rdtsc"
+version = "4.2.1"
+dependencies = [
+ "criterion",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
