@@ -116,6 +116,7 @@ pub struct VotingContext {
     pub cluster_info: Arc<ClusterInfo>,
     pub vote_history: VoteHistory,
     pub vote_account_pubkey: Pubkey,
+    pub shared_vote_account: Arc<std::sync::RwLock<Pubkey>>,
     pub identity_keypair: Arc<Keypair>,
     pub authorized_voter_keypairs: Arc<RwLock<Vec<Arc<Keypair>>>>,
     // The BLS keypair should always change with authorized_voter_keypairs.
@@ -411,10 +412,12 @@ mod tests {
         let bls_sender = bounded(1024).0;
         let commitment_sender = bounded(1024).0;
         let consensus_metrics_sender = bounded(1024).0;
+        let vote_account_pubkey = my_keys.vote_keypair.pubkey();
         let voting_context = VotingContext {
             cluster_info,
             vote_history: VoteHistory::new(my_keys.node_keypair.pubkey(), 0),
-            vote_account_pubkey: my_keys.vote_keypair.pubkey(),
+            vote_account_pubkey,
+            shared_vote_account: Arc::new(RwLock::new(vote_account_pubkey)),
             identity_keypair: Arc::new(my_keys.node_keypair.insecure_clone()),
             authorized_voter_keypairs: Arc::new(RwLock::new(vec![Arc::new(
                 my_keys.vote_keypair.insecure_clone(),
