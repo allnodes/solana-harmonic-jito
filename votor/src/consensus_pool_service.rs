@@ -55,6 +55,7 @@ pub(crate) struct ConsensusPoolContext {
 
     pub(crate) cluster_info: Arc<ClusterInfo>,
     pub(crate) my_vote_pubkey: Pubkey,
+    pub(crate) shared_vote_account: Arc<RwLock<Pubkey>>,
     pub(crate) blockstore: Arc<Blockstore>,
     pub(crate) sharable_banks: SharableBanks,
     pub(crate) leader_schedule_cache: Arc<LeaderScheduleCache>,
@@ -324,6 +325,16 @@ impl ConsensusPoolService {
 
         // Ingest votes into consensus pool and notify voting loop of new events
         while !ctx.exit.load(Ordering::Relaxed) {
+            // Update the vote account if it has changed
+            let new_vote_pubkey = *ctx.shared_vote_account.read().unwrap();
+            if ctx.my_vote_pubkey != new_vote_pubkey {
+                warn!(
+                    "Certificate pool vote account updated from {} to {new_vote_pubkey}",
+                    ctx.my_vote_pubkey
+                );
+                ctx.my_vote_pubkey = new_vote_pubkey;
+            }
+
             // Kick off parent ready event, this either happens:
             // - When we first migrate to alpenglow from TowerBFT - kick off with genesis block
             // - If we startup post alpenglow migration - kick off with root block
@@ -762,6 +773,7 @@ mod tests {
                 generated_cert_types,
                 cluster_info,
                 my_vote_pubkey,
+                shared_vote_account: Arc::new(RwLock::new(my_vote_pubkey)),
                 blockstore,
                 sharable_banks,
                 leader_schedule_cache,

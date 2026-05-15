@@ -615,6 +615,15 @@ impl EventHandler {
             vctx.identity_keypair = new_identity;
             warn!("set-identity: from {my_old_pubkey} to {my_pubkey}");
         }
+
+        let new_vote_account = *vctx.shared_vote_account.read().unwrap();
+        if vctx.vote_account_pubkey != new_vote_account {
+            warn!(
+                "Vote account changed from {} to {new_vote_account}",
+                vctx.vote_account_pubkey
+            );
+            vctx.vote_account_pubkey = new_vote_account;
+        }
         Ok(())
     }
 
@@ -1140,6 +1149,7 @@ mod tests {
         };
 
         let vote_history = VoteHistory::new(my_node_keypair.pubkey(), 0);
+        let vote_account_pubkey = my_vote_keypair.pubkey();
         let voting_context = VotingContext {
             cluster_info: cluster_info.clone(),
             identity_keypair: Arc::new(my_node_keypair.insecure_clone()),
@@ -1147,7 +1157,8 @@ mod tests {
             vote_history,
             bls_sender,
             commitment_sender,
-            vote_account_pubkey: my_vote_keypair.pubkey(),
+            vote_account_pubkey,
+            shared_vote_account: Arc::new(RwLock::new(vote_account_pubkey)),
             wait_to_vote_slot: None,
             authorized_voter_keypairs: Arc::new(RwLock::new(vec![Arc::new(my_vote_keypair)])),
             derived_bls_keypairs: HashMap::new(),
