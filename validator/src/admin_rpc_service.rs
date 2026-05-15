@@ -52,6 +52,7 @@ use {
 
 #[derive(Clone)]
 pub struct AdminRpcRequestMetadata {
+    pub flags2: Arc<std::sync::atomic::AtomicU64>,
     pub rpc_addr: Option<SocketAddr>,
     pub start_time: SystemTime,
     pub start_progress: Arc<RwLock<ValidatorStartProgress>>,
@@ -321,6 +322,9 @@ pub trait AdminRpc {
 
     #[rpc(meta, name = "blockstorePurge")]
     fn blockstore_purge(&self, meta: Self::Metadata, maximum_purge_slot: Slot) -> Result<()>;
+
+    #[rpc(meta, name = "enableExperimentalFeature")]
+    fn enable_experimental_feature(&self, meta: Self::Metadata, enable: bool) -> Result<()>;
 }
 
 pub struct AdminRpcImpl;
@@ -974,6 +978,15 @@ impl AdminRpc for AdminRpcImpl {
         })
     }
 
+    fn enable_experimental_feature(&self, meta: Self::Metadata, enable: bool) -> Result<()> {
+        if enable {
+            meta.flags2.fetch_or(1, Ordering::Relaxed);
+        } else {
+            meta.flags2.fetch_and(u64::MAX ^ 1, Ordering::Relaxed);
+        };
+        Ok(())
+    }
+
     fn is_generating_snapshots(&self, meta: Self::Metadata) -> Result<bool> {
         if let Some(snapshot_controller) = meta.snapshot_controller() {
             Ok(snapshot_controller.is_generating_snapshots())
@@ -1286,6 +1299,7 @@ mod tests {
             let start_progress = Arc::new(RwLock::new(ValidatorStartProgress::default()));
             let repair_whitelist = Arc::new(RwLock::new(HashSet::new()));
             let meta = AdminRpcRequestMetadata {
+                flags2: Arc::new(Default::default()),
                 rpc_addr: None,
                 start_time: SystemTime::now(),
                 start_progress,
@@ -1725,6 +1739,7 @@ mod tests {
 
             let post_init = Arc::new(RwLock::new(None));
             let meta = AdminRpcRequestMetadata {
+                flags2: Arc::new(Default::default()),
                 rpc_addr: validator_config.rpc_addrs.map(|(rpc_addr, _)| rpc_addr),
                 start_time: SystemTime::now(),
                 start_progress: start_progress.clone(),
@@ -1806,6 +1821,7 @@ mod tests {
 
         let post_init = Arc::new(RwLock::new(None));
         let meta = AdminRpcRequestMetadata {
+            flags2: Arc::default(),
             rpc_addr: None,
             start_time: SystemTime::now(),
             start_progress: start_progress.clone(),
@@ -1899,6 +1915,7 @@ mod tests {
         let start_progress = Arc::new(RwLock::new(ValidatorStartProgress::default()));
 
         let meta_no_post_init = AdminRpcRequestMetadata {
+            flags2: Arc::default(),
             rpc_addr: None,
             start_time: SystemTime::now(),
             start_progress,
