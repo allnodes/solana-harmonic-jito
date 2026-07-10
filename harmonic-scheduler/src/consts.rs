@@ -24,7 +24,7 @@ pub const VOTE_STORAGE_CAPACITY: usize = 400 * 1024;
 pub const NONVOTE_STORAGE_CAPACITY: usize = 64 * 1024;
 
 /// `tpu_to_pack` queue: `TpuToPackMessage` (`SharableTransactionRegion`)
-pub const TPU_TO_PACK_CAPACITY: usize = 1024;
+pub const TPU_TO_PACK_CAPACITY: usize = 64 * 1024;
 /// `pack_to_worker` queue: `PackToWorkerMessage` (`SharableTransactionBatchRegion`)
 pub const PACK_TO_WORKER_CAPACITY: usize = 64;
 /// `worker_to_pack` queue: `WorkerToPackMessage` (`SharableTransactionBatchRegion` + `TransactionResponseRegion`)
