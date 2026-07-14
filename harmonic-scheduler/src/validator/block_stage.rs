@@ -14,7 +14,7 @@ use agave_transaction_view::transaction_view::UnsanitizedTransactionView;
 use anyhow::{Result, bail};
 use indexmap::IndexMap;
 use indexmap::map::Entry;
-use log::{error, info, trace, warn};
+use log::{error, info, warn};
 use rdtsc::Instant;
 use rts_alloc::Allocator;
 use rustc_hash::{FxBuildHasher, FxHashMap};
@@ -121,7 +121,6 @@ impl AccountLocks {
     }
 }
 
-#[derive(Default, Clone, Copy, PartialEq)]
 struct Metrics {
     total: usize,
     alt: usize,
@@ -131,6 +130,23 @@ struct Metrics {
     executing: usize,
     success: usize,
     fail: usize,
+    errors: [usize; 256],
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            alt: 0,
+            unresolved: 0,
+            checking: 0,
+            resolved: 0,
+            executing: 0,
+            success: 0,
+            fail: 0,
+            errors: [0; 256],
+        }
+    }
 }
 
 impl std::fmt::Display for Metrics {
@@ -144,32 +160,21 @@ impl std::fmt::Display for Metrics {
             executing,
             success,
             fail,
+            errors,
         } = self;
         write!(
             f,
             "total={total} alt={alt} unresolved={unresolved} checking={checking} \
-             resolved={resolved} executing={executing} success={success} fail={fail}",
-        )
-    }
-}
-
-impl std::fmt::Debug for Metrics {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            total,
-            alt,
-            unresolved,
-            checking,
-            resolved,
-            executing,
-            success,
-            fail,
-        } = self;
-        write!(
-            f,
-            "{total:04x}{alt:04x}{unresolved:04x}{checking:04x}{resolved:04x}{executing:\
-             04x}{success:04x}{fail:04x}",
-        )
+             resolved={resolved} executing={executing} success={success} fail={fail} errors={{",
+        )?;
+        let mut errors = errors.iter().enumerate().filter(|&(_, &count)| count != 0);
+        if let Some((reason, count)) = errors.next() {
+            write!(f, "{reason}:{count}")?;
+            for (reason, count) in errors {
+                write!(f, " {reason}:{count}")?;
+            }
+        }
+        write!(f, "}}")
     }
 }
 
@@ -209,12 +214,6 @@ pub struct BlockStage<'a> {
     block_metrics: Metrics,
     /// Metrics for the vote stage transactions
     vote_metrics: Metrics,
-    /// Timer for slot measurements
-    timer: Instant,
-    /// Timing metrics for the full block stage
-    /// Only collected when log level == Trace
-    block_timing: Vec<(u64, Metrics)>,
-    vote_timing: Vec<(u64, Metrics)>,
 }
 
 impl<'a> BlockStage<'a> {
@@ -241,17 +240,6 @@ impl<'a> BlockStage<'a> {
             processing: 0,
             block_metrics: Metrics::default(),
             vote_metrics: Metrics::default(),
-            timer: Instant::now(),
-            block_timing: if log::log_enabled!(log::Level::Trace) {
-                Vec::with_capacity(4096)
-            } else {
-                Vec::new()
-            },
-            vote_timing: if log::log_enabled!(log::Level::Trace) {
-                Vec::with_capacity(4096)
-            } else {
-                Vec::new()
-            },
         }
     }
 
@@ -265,22 +253,6 @@ impl<'a> BlockStage<'a> {
         producers: &mut [shaq::spsc::Producer<PackToWorkerMessage>],
         consumers: &mut [shaq::spsc::Consumer<WorkerToPackMessage>],
     ) {
-        if log::log_enabled!(log::Level::Trace) {
-            if self.tasks.is_empty() {
-                self.timer = Instant::now();
-            } else {
-                let us = self.timer.elapsed_us();
-                if self.block_timing.last().map(|&(_, m)| m) != Some(self.block_metrics) {
-                    self.block_timing.push((us, self.block_metrics));
-                }
-                if self.vote_idx != usize::MAX
-                    && self.vote_timing.last().map(|&(_, m)| m) != Some(self.vote_metrics)
-                {
-                    self.vote_timing.push((us, self.vote_metrics));
-                }
-            }
-        }
-
         for bundle in bundles {
             self.insert(bundle);
         }
@@ -315,13 +287,6 @@ impl<'a> BlockStage<'a> {
         if dropped != 0 {
             error!("failed to execute full block: dropped={dropped}");
         }
-        if log::log_enabled!(log::Level::Trace) {
-            let us = self.timer.elapsed_us();
-            self.block_timing.push((us, self.block_metrics));
-            self.vote_timing.push((us, self.vote_metrics));
-        }
-        trace!("block_timing: {:?}", self.block_timing);
-        trace!("vote_timing: {:?}", self.vote_timing);
         self.unresolved_idx = 0;
         self.try_idx = 0;
         self.resolved_idx = 0;
@@ -333,8 +298,6 @@ impl<'a> BlockStage<'a> {
         self.compute_units = [0; MAX_WORKERS];
         self.block_metrics = Metrics::default();
         self.vote_metrics = Metrics::default();
-        self.block_timing.clear();
-        self.vote_timing.clear();
 
         let allocator = self.allocator;
         Ok(self.tasks.drain(..).filter_map(move |(_, task)| {
@@ -626,6 +589,13 @@ impl<'a> BlockStage<'a> {
                 error!("unexpected ACCOUNT_IN_USE in scheduled batch");
             }
             metrics.fail += n;
+            for reason in results
+                .iter()
+                .map(|r| r.not_included_reason)
+                .filter(|&reason| reason != not_included_reasons::NONE)
+            {
+                metrics.errors[reason as usize] += 1;
+            }
         }
         task.batch.free_full(self.allocator);
         message.responses.free(self.allocator);
