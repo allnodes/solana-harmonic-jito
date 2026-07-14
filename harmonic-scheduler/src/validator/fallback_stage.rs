@@ -9,13 +9,12 @@ use agave_scheduler_bindings::{
     processed_codes,
 };
 use anyhow::{Result, bail};
-use log::{info, trace};
+use log::info;
 use rdtsc::Instant;
 use rts_alloc::Allocator;
 use std::collections::VecDeque;
 
 /// Monotonic per-slot counters for the fallback stage
-#[derive(Default, Clone, Copy, PartialEq)]
 struct Metrics {
     /// Transactions inserted
     total: usize,
@@ -25,6 +24,20 @@ struct Metrics {
     fail: usize,
     /// Transactions that we dropped without landing
     dropped: usize,
+    /// Failure counts indexed by `not_included_reason`
+    errors: [usize; 256],
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            success: 0,
+            fail: 0,
+            dropped: 0,
+            errors: [0; 256],
+        }
+    }
 }
 
 impl std::fmt::Display for Metrics {
@@ -34,23 +47,20 @@ impl std::fmt::Display for Metrics {
             success,
             fail,
             dropped,
+            errors,
         } = self;
         write!(
             f,
-            "total={total} success={success} fail={fail} dropped={dropped}"
-        )
-    }
-}
-
-impl std::fmt::Debug for Metrics {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            total,
-            success,
-            fail,
-            dropped,
-        } = self;
-        write!(f, "{total:04x}{success:04x}{fail:04x}{dropped:04x}")
+            "total={total} success={success} fail={fail} dropped={dropped} errors={{"
+        )?;
+        let mut errors = errors.iter().enumerate().filter(|&(_, &count)| count != 0);
+        if let Some((reason, count)) = errors.next() {
+            write!(f, "{reason}:{count}")?;
+            for (reason, count) in errors {
+                write!(f, " {reason}:{count}")?;
+            }
+        }
+        write!(f, "}}")
     }
 }
 
@@ -68,10 +78,6 @@ pub struct FallbackStage<'a> {
     slot_end: bool,
     /// Per-slot metrics
     metrics: Metrics,
-    /// Timer for slot measurements
-    timer: Instant,
-    /// Timing snapshots through the slot, collected only at log level Trace
-    timing: Vec<(u64, Metrics)>,
 }
 
 impl<'a> FallbackStage<'a> {
@@ -87,12 +93,6 @@ impl<'a> FallbackStage<'a> {
             processing: 0,
             slot_end: false,
             metrics: Metrics::default(),
-            timer: Instant::now(),
-            timing: if log::log_enabled!(log::Level::Trace) {
-                Vec::with_capacity(4096)
-            } else {
-                Vec::new()
-            },
         }
     }
 
@@ -104,13 +104,6 @@ impl<'a> FallbackStage<'a> {
         producers: &mut [shaq::spsc::Producer<PackToWorkerMessage>],
         consumers: &mut [shaq::spsc::Consumer<WorkerToPackMessage>],
     ) {
-        if log::log_enabled!(log::Level::Trace) {
-            if self.metrics.total == 0 {
-                self.timer = Instant::now();
-            } else if self.timer.elapsed_us() >= 250 {
-                self.timing.push((self.timer.elapsed_us(), self.metrics));
-            }
-        }
         self.execute(slot, txs, producers);
         self.resolve(consumers);
     }
@@ -139,13 +132,8 @@ impl<'a> FallbackStage<'a> {
             );
         }
         self.metrics.dropped += self.txs.len();
-        if log::log_enabled!(log::Level::Trace) && self.metrics.total != 0 {
-            self.timing.push((self.timer.elapsed_us(), self.metrics));
-        }
         info!("fallback_metrics: {}", self.metrics);
-        trace!("fallback_timing: {:?}", self.timing);
         self.metrics = Metrics::default();
-        self.timing.clear();
         self.slot_end = false;
         for tx in self.txs.drain(..) {
             tx.free(self.allocator);
@@ -228,6 +216,7 @@ impl<'a> FallbackStage<'a> {
                             self.slot_end = true;
                         }
                         self.metrics.fail += 1;
+                        self.metrics.errors[result.not_included_reason as usize] += 1;
                     }
                     tx.free(self.allocator);
                 }
@@ -409,6 +398,11 @@ mod tests {
         );
         assert!(m.success > 0, "success path exercised ({m})");
         assert!(m.fail > 0, "fail path exercised ({m})");
+        assert_eq!(
+            m.errors[not_included_reasons::INSTRUCTION_ERROR as usize],
+            m.fail,
+            "every failure is attributed to its reason code ({m})",
+        );
         assert!(m.dropped > 0, "dropped path exercised ({m})");
         assert!(!fallback.backpressured(), "backlog drained");
 
