@@ -5,6 +5,7 @@ use {
         qos_service::QosService,
         scheduler_messages::MaxAge,
     },
+    solana_cost_model::transaction_cost::TransactionCost,
     solana_fee::FeeFeatures,
     solana_measure::measure_us,
     solana_poh::{
@@ -13,7 +14,8 @@ use {
     },
     solana_runtime::{
         bank::{
-            Bank, LoadAndExecuteTransactionsOutput, entry_bytes_budget::EntryBytesReserveError,
+            Bank, LoadAndExecuteTransactionsOutput, ProcessedTransactionCounts,
+            entry_bytes_budget::EntryBytesReserveError,
         },
         transaction_batch::TransactionBatch,
     },
@@ -21,7 +23,9 @@ use {
     solana_svm::{
         account_loader::validate_fee_payer,
         transaction_error_metrics::TransactionErrorMetrics,
-        transaction_processing_result::TransactionProcessingResultExtensions,
+        transaction_processing_result::{
+            TransactionProcessingResult, TransactionProcessingResultExtensions,
+        },
         transaction_processor::{ExecutionRecordingConfig, TransactionProcessingConfig},
     },
     solana_transaction_error::TransactionError,
@@ -36,7 +40,7 @@ pub(crate) const ENTRY_OVERHEAD_BYTES: u64 = 48;
 
 const SERIALIZED_ENTRIES_OVERHEAD: u64 = ENTRY_OVERHEAD_BYTES + 8; // Vec<Entry> length
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct ExecutionFlags {
     /// Should failing transactions within the batch be dropped (no fee charged
     /// & not committed).
@@ -50,6 +54,8 @@ pub struct ExecutionFlags {
     /// failing transactions to be committed. If both flags are set then any
     /// failing transaction will cause all transactions to be aborted.
     pub all_or_nothing: bool,
+    /// Gate cost admission on post-execution usage instead of declared cost.
+    pub defer_cost_admission: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -156,6 +162,7 @@ impl Consumer {
             ExecutionFlags {
                 drop_on_failure: false,
                 all_or_nothing: false,
+                defer_cost_admission: false,
             },
         );
 
@@ -200,7 +207,8 @@ impl Consumer {
         ) = measure_us!(QosService::select_and_accumulate_transaction_costs(
             bank,
             txs,
-            pre_results
+            pre_results,
+            flags.defer_cost_admission,
         ));
 
         // Only lock accounts for those transactions are selected for the block;
@@ -232,11 +240,13 @@ impl Consumer {
         // To ensure accurate tracking of compute units, transactions that ultimately
         // were not included in the block should have their cost removed, the rest
         // should update with their actually consumed units.
-        QosService::remove_or_update_costs(
-            transaction_qos_cost_results.iter(),
-            commit_transactions_result.as_ref().ok(),
-            bank,
-        );
+        if !flags.defer_cost_admission {
+            QosService::remove_or_update_costs(
+                transaction_qos_cost_results.iter(),
+                commit_transactions_result.as_ref().ok(),
+                bank,
+            );
+        }
 
         debug!(
             "bank: {} lock: {}us unlock: {}us txs_len: {}",
@@ -337,10 +347,23 @@ impl Consumer {
         execute_and_commit_timings.load_execute_us = load_execute_us;
 
         let LoadAndExecuteTransactionsOutput {
-            processing_results,
-            processed_counts,
+            mut processing_results,
+            mut processed_counts,
             balance_collector,
         } = load_and_execute_transactions_output;
+
+        // Reserve actual costs before anything is recorded or committed.
+        let actual_cost_reservations = flags.defer_cost_admission.then(|| {
+            Self::reserve_actual_costs(
+                bank,
+                batch.sanitized_transactions(),
+                flags.all_or_nothing,
+                &mut processing_results,
+                &mut processed_counts,
+                &mut error_counters,
+                &mut retryable_transaction_indexes,
+            )
+        });
 
         let transaction_counts = LeaderProcessedTransactionCounts {
             processed_count: processed_counts.processed_transactions_count,
@@ -395,6 +418,11 @@ impl Consumer {
         };
 
         if let Err(recorder_err) = recording_result {
+            // Nothing was committed; release the reservations.
+            if let Some(reservations) = &actual_cost_reservations {
+                QosService::remove_or_update_costs(reservations.iter(), None, bank);
+            }
+
             retryable_transaction_indexes.extend(processing_results.iter().enumerate().filter_map(
                 |(index, processing_result)| {
                     processing_result.was_processed().then_some(RetryableIndex {
@@ -441,6 +469,14 @@ impl Consumer {
                 )
             };
 
+        if let Some(reservations) = &actual_cost_reservations {
+            QosService::remove_or_update_costs(
+                reservations.iter(),
+                Some(&commit_transaction_statuses),
+                bank,
+            );
+        }
+
         drop(freeze_lock);
 
         debug!(
@@ -469,6 +505,84 @@ impl Consumer {
             execute_and_commit_timings,
             error_counters,
         }
+    }
+
+    /// Reserves the batch's actual, post-execution costs, folding any
+    /// rejection into the output arguments as if it were a pre-execution
+    /// rejection. Returns the reservations for later finalization via
+    /// `QosService::remove_or_update_costs`.
+    fn reserve_actual_costs<'a, Tx: TransactionWithMeta>(
+        bank: &Bank,
+        transactions: &'a [Tx],
+        all_or_nothing: bool,
+        processing_results: &mut [TransactionProcessingResult],
+        processed_counts: &mut ProcessedTransactionCounts,
+        error_counters: &mut TransactionErrorMetrics,
+        retryable_transaction_indexes: &mut Vec<RetryableIndex>,
+    ) -> Vec<Result<TransactionCost<'a, Tx>, TransactionError>> {
+        // Check each processed transaction's actual cost against the block
+        // limits and reserve it in the cost tracker if it fits.
+        let reservations = QosService::try_reserve_actual_costs(
+            bank,
+            transactions,
+            processing_results,
+            all_or_nothing,
+        );
+        let num_retryable_before = retryable_transaction_indexes.len();
+        for (index, ((reservation, processing_result), tx)) in reservations
+            .iter()
+            .zip(processing_results.iter_mut())
+            .zip(transactions)
+            .enumerate()
+        {
+            // Only rejections of processed transactions need folding in.
+            let Err(err) = reservation else { continue };
+            if processing_result.is_err() {
+                continue; // was never processed to begin with; nothing to undo
+            }
+
+            // Reverse this transaction's contributions to `processed_counts`,
+            // mirroring how `load_and_execute_transactions` accumulated them.
+            processed_counts.processed_transactions_count -= 1;
+            processed_counts.signature_count -= tx.signature_details().num_transaction_signatures();
+            if !tx.is_simple_vote_transaction() {
+                processed_counts.processed_non_vote_transactions_count -= 1;
+            }
+            if processing_result.was_processed_with_successful_result() {
+                processed_counts.processed_with_successful_result_count -= 1;
+            }
+
+            // Count the rejection, mirroring the pre-execution scan of
+            // `lock_results` in `execute_and_commit_transactions_locked`.
+            match err {
+                TransactionError::WouldExceedMaxBlockCostLimit => {
+                    error_counters.would_exceed_max_block_cost_limit += 1;
+                }
+                TransactionError::WouldExceedMaxVoteCostLimit => {
+                    error_counters.would_exceed_max_vote_cost_limit += 1;
+                }
+                TransactionError::WouldExceedMaxAccountCostLimit => {
+                    error_counters.would_exceed_max_account_cost_limit += 1;
+                }
+                TransactionError::WouldExceedAccountDataBlockLimit => {
+                    error_counters.would_exceed_account_data_block_limit += 1;
+                }
+                _ => {}
+            }
+
+            // Overwrite the execution result so the transaction is excluded
+            // from recording/commit, and mark it retryable in a later block.
+            *processing_result = Err(err.clone());
+            retryable_transaction_indexes.push(RetryableIndex {
+                index,
+                immediately_retryable: false,
+            });
+        }
+        // Restore the index-sorted order expected by callers.
+        if retryable_transaction_indexes.len() != num_retryable_before {
+            retryable_transaction_indexes.sort_unstable();
+        }
+        reservations
     }
 
     pub fn check_fee_payer_unlocked(
@@ -515,7 +629,7 @@ mod tests {
             self as address_lookup_table,
             state::{AddressLookupTable, LookupTableMeta},
         },
-        solana_cost_model::cost_model::CostModel,
+        solana_cost_model::{cost_model::CostModel, cost_tracker::CostTrackerLimits},
         solana_fee_calculator::FeeCalculator,
         solana_hash::Hash,
         solana_instruction::error::InstructionError,
@@ -1054,6 +1168,223 @@ mod tests {
                 retryable_transaction_indexes,
                 vec![RetryableIndex::new(1, true)]
             );
+        }
+    }
+
+    fn fund_payer(bank: &Bank, payer: &Keypair) {
+        bank.store_account(
+            &payer.pubkey(),
+            &AccountSharedData::new(10_000, 0, &system_program::id()),
+        );
+    }
+
+    /// Commits the built transaction on a throwaway bank and returns its
+    /// actual (post-rebate) cost.
+    fn measure_actual_cost(build_transaction: impl Fn(&Bank) -> Transaction) -> u64 {
+        let TestFrame {
+            bank,
+            consumer,
+            bank_forks: _bank_forks,
+            record_receiver: _record_receiver,
+            ..
+        } = setup_test(None);
+        let transaction = build_transaction(&bank);
+        bank.store_account(
+            &transaction.message.account_keys[0],
+            &AccountSharedData::new(10_000, 0, &system_program::id()),
+        );
+        let transactions = sanitize_transactions(vec![transaction]);
+        let output = consumer.process_and_record_transactions(&bank, &transactions);
+        let commit_results = output
+            .execute_and_commit_transactions_output
+            .commit_transactions_result
+            .unwrap();
+        assert!(
+            commit_results
+                .iter()
+                .all(|r| matches!(r, CommitTransactionDetails::Committed { .. }))
+        );
+        let cost = bank.read_cost_tracker().unwrap().block_cost();
+        assert_ne!(cost, 0);
+        cost
+    }
+
+    /// Sets up two independently fee-paid transfers (so they don't conflict
+    /// on account locks) on a bank whose block cost limit fits one and a
+    /// half of them, so the second is rejected on actual cost.
+    fn setup_defer_cost_admission_test() -> (
+        TestFrame,
+        Vec<RuntimeTransaction<solana_transaction::sanitized::SanitizedTransaction>>,
+    ) {
+        let payer_a = Keypair::new();
+        let payer_b = Keypair::new();
+        let transfer = |payer: &Keypair, bank: &Bank| {
+            system_transaction::transfer(
+                payer,
+                &solana_pubkey::new_rand(),
+                1,
+                bank.last_blockhash(),
+            )
+        };
+
+        let one_transfer_cost = measure_actual_cost(|bank| transfer(&payer_a, bank));
+
+        let frame = setup_test(None);
+        fund_payer(&frame.bank, &payer_a);
+        fund_payer(&frame.bank, &payer_b);
+        frame
+            .bank
+            .write_cost_tracker()
+            .unwrap()
+            .set_limits(CostTrackerLimits::new(
+                u64::MAX,
+                one_transfer_cost + one_transfer_cost / 2,
+                u64::MAX,
+            ));
+        let transactions = sanitize_transactions(vec![
+            transfer(&payer_a, &frame.bank),
+            transfer(&payer_b, &frame.bank),
+        ]);
+        (frame, transactions)
+    }
+
+    #[test]
+    fn test_defer_cost_admission_rejects_independently_not_atomically() {
+        // With `all_or_nothing: false`, one transaction's actual cost not
+        // fitting the remaining block budget must not drag down its
+        // unrelated sibling.
+        let (frame, transactions) = setup_defer_cost_admission_test();
+        let output = frame.consumer.process_and_record_aged_transactions(
+            &frame.bank,
+            &transactions,
+            &vec![MaxAge::MAX; transactions.len()],
+            ExecutionFlags {
+                drop_on_failure: false,
+                all_or_nothing: false,
+                defer_cost_admission: true,
+            },
+        );
+
+        let commit_results = output
+            .execute_and_commit_transactions_output
+            .commit_transactions_result
+            .unwrap();
+        assert_eq!(commit_results.len(), 2);
+        assert!(matches!(
+            commit_results[0],
+            CommitTransactionDetails::Committed { .. }
+        ));
+        assert!(matches!(
+            commit_results[1],
+            CommitTransactionDetails::NotCommitted(TransactionError::WouldExceedMaxBlockCostLimit)
+        ));
+    }
+
+    #[test]
+    fn test_defer_cost_admission_all_or_nothing_rejects_whole_group() {
+        // With `all_or_nothing: true`, one transaction's actual cost not
+        // fitting must roll back its sibling's reservation too, so neither
+        // commits.
+        let (frame, transactions) = setup_defer_cost_admission_test();
+        let output = frame.consumer.process_and_record_aged_transactions(
+            &frame.bank,
+            &transactions,
+            &vec![MaxAge::MAX; transactions.len()],
+            ExecutionFlags {
+                drop_on_failure: false,
+                all_or_nothing: true,
+                defer_cost_admission: true,
+            },
+        );
+
+        let commit_results = output
+            .execute_and_commit_transactions_output
+            .commit_transactions_result
+            .unwrap();
+        assert_eq!(commit_results.len(), 2);
+        assert!(matches!(
+            commit_results[0],
+            CommitTransactionDetails::NotCommitted(TransactionError::CommitCancelled)
+        ));
+        assert!(matches!(
+            commit_results[1],
+            CommitTransactionDetails::NotCommitted(TransactionError::WouldExceedMaxBlockCostLimit)
+        ));
+        assert_eq!(
+            frame.bank.read_cost_tracker().unwrap().block_cost(),
+            0,
+            "nothing from the rejected group should remain reserved"
+        );
+    }
+
+    #[test]
+    fn test_defer_cost_admission_admits_on_actual_not_declared_cost() {
+        // The capability this feature exists for: a transaction declaring a
+        // far higher compute unit limit than it uses, on a bank whose budget
+        // fits its actual cost but not its declared cost, is rejected under
+        // declared-cost admission and committed under deferred admission.
+        let payer = Keypair::new();
+        let build_transaction = |bank: &Bank| {
+            Transaction::new(
+                &[&payer],
+                solana_message::Message::new(
+                    &[
+                        solana_compute_budget_interface::ComputeBudgetInstruction::set_compute_unit_limit(1_000_000),
+                        solana_system_interface::instruction::transfer(
+                            &payer.pubkey(),
+                            &solana_pubkey::new_rand(),
+                            1,
+                        ),
+                    ],
+                    Some(&payer.pubkey()),
+                ),
+                bank.last_blockhash(),
+            )
+        };
+
+        let actual_cost = measure_actual_cost(build_transaction);
+
+        let frame = setup_test(None);
+        fund_payer(&frame.bank, &payer);
+        let transactions = sanitize_transactions(vec![build_transaction(&frame.bank)]);
+        let declared_cost =
+            CostModel::calculate_cost(&transactions[0], &frame.bank.feature_set).sum();
+        let budget = (actual_cost + declared_cost) / 2;
+        assert!(actual_cost < budget && budget < declared_cost);
+        frame
+            .bank
+            .write_cost_tracker()
+            .unwrap()
+            .set_limits(CostTrackerLimits::new(u64::MAX, budget, u64::MAX));
+
+        for defer_cost_admission in [false, true] {
+            let output = frame.consumer.process_and_record_aged_transactions(
+                &frame.bank,
+                &transactions,
+                &[MaxAge::MAX],
+                ExecutionFlags {
+                    drop_on_failure: false,
+                    all_or_nothing: false,
+                    defer_cost_admission,
+                },
+            );
+            let commit_results = output
+                .execute_and_commit_transactions_output
+                .commit_transactions_result
+                .unwrap();
+            if defer_cost_admission {
+                assert!(matches!(
+                    commit_results[0],
+                    CommitTransactionDetails::Committed { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    commit_results[0],
+                    CommitTransactionDetails::NotCommitted(
+                        TransactionError::WouldExceedMaxBlockCostLimit
+                    )
+                ));
+            }
         }
     }
 
