@@ -3,7 +3,7 @@ use {
         config::{Config, ExplicitRelease},
         stop_process::stop_process,
     },
-    console::{Emoji, style},
+    console::{style, Emoji},
     crossbeam_channel::unbounded,
     indicatif::{ProgressBar, ProgressStyle},
     serde::{Deserialize, Serialize},
@@ -150,7 +150,7 @@ fn extract_release_archive(
     archive: &Path,
     extract_dir: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use {bzip2::bufread::BzDecoder, tar::Archive};
+    use {flate2::bufread::GzDecoder, tar::Archive};
 
     let progress_bar = new_spinner_progress_bar();
     progress_bar.set_message(format!("{PACKAGE}Extracting..."));
@@ -166,7 +166,7 @@ fn extract_release_archive(
     fs::create_dir_all(&tmp_extract_dir)?;
 
     let tar_bz2 = File::open(archive)?;
-    let tar = BzDecoder::new(BufReader::new(tar_bz2));
+    let tar = GzDecoder::new(BufReader::new(tar_bz2));
     let mut release = Archive::new(tar);
     release.unpack(&tmp_extract_dir)?;
 
@@ -262,8 +262,8 @@ pub fn string_from_winreg_value(val: &winreg::RegValue) -> Option<String> {
 #[cfg(windows)]
 fn get_windows_path_var() -> Result<Option<String>, String> {
     use winreg::{
-        RegKey,
         enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE},
+        RegKey,
     };
 
     let root = RegKey::predef(HKEY_CURRENT_USER);
@@ -296,12 +296,12 @@ fn add_to_path(new_path: &str) -> bool {
         winapi::{
             shared::minwindef::*,
             um::winuser::{
-                HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutA, WM_SETTINGCHANGE,
+                SendMessageTimeoutA, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
             },
         },
         winreg::{
+            enums::{RegType, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE},
             RegKey, RegValue,
-            enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, RegType},
         },
     };
 
@@ -482,27 +482,15 @@ pub fn init(
 }
 
 fn github_release_download_url(release_semver: &str) -> String {
-    format!(
-        "https://github.com/anza-xyz/agave/releases/download/v{}/solana-release-{}.tar.bz2",
-        release_semver,
-        crate::build_env::TARGET
-    )
+    format!("https://github.com/allnodes/solana-harmonic/releases/download/v{release_semver}/solana-harmonic-v{release_semver}.tar.gz")
 }
 
-fn release_channel_download_url(release_channel: &str) -> String {
-    format!(
-        "https://release.anza.xyz/{}/solana-release-{}.tar.bz2",
-        release_channel,
-        crate::build_env::TARGET
-    )
+fn release_channel_download_url(_release_channel: &str) -> String {
+    panic!("Release channels are not supported");
 }
 
-fn release_channel_version_url(release_channel: &str) -> String {
-    format!(
-        "https://release.anza.xyz/{}/solana-release-{}.yml",
-        release_channel,
-        crate::build_env::TARGET
-    )
+fn release_channel_version_url(_release_channel: &str) -> String {
+    panic!("Release channels are not supported");
 }
 
 pub fn info(config_file: &str, local_info_only: bool, eval: bool) -> Result<(), String> {
@@ -691,7 +679,7 @@ fn check_for_newer_github_release(
 
     while page == 1 || releases.len() == PER_PAGE {
         let url = reqwest::Url::parse_with_params(
-            "https://api.github.com/repos/anza-xyz/agave/releases",
+            "https://api.github.com/repos/allnodes/solana-harmonic/releases",
             &[
                 ("per_page", &format!("{PER_PAGE}")),
                 ("page", &format!("{page}")),
@@ -885,9 +873,9 @@ pub fn init_or_update(config_file: &str, is_init: bool, check_only: bool) -> Res
         let (_temp_dir, temp_archive, _temp_archive_sha256) =
             download_to_temp(&download_url, archive_sha256.as_ref())
                 .map_err(|err| format!("Unable to download {download_url}: {err}"))?;
-        extract_release_archive(&temp_archive, &release_dir).map_err(|err| {
-            format!("Unable to extract {temp_archive:?} to {release_dir:?}: {err}")
-        })?;
+        extract_release_archive(&temp_archive, &release_dir.join("solana-release")).map_err(
+            |err| format!("Unable to extract {temp_archive:?} to {release_dir:?}: {err}"),
+        )?;
     }
 
     let release_target = load_release_target(&release_dir)
@@ -1042,13 +1030,13 @@ pub fn list(config_file: &str) -> Result<(), String> {
         )
     })?;
 
-    let current_version =
-        load_release_version(&config.active_release_dir().join("version.yml"))?.channel;
-
     for entry in entries {
         match entry {
             Ok(entry) => {
                 let dir_name = entry.file_name();
+                let current_version =
+                    load_release_version(&config.active_release_dir().join("version.yml"))?.channel;
+
                 let current = if current_version.contains(dir_name.to_string_lossy().as_ref()) {
                     " (current)"
                 } else {
