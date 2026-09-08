@@ -3513,7 +3513,6 @@ dependencies = [
  "solana-instruction",
  "solana-keypair",
  "solana-message",
- "solana-packet 4.3.0",
  "solana-pubkey 4.3.0",
  "solana-sdk-ids",
  "solana-signature",

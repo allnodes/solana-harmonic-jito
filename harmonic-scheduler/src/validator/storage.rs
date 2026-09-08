@@ -69,7 +69,13 @@ impl<'a> Storage<'a> {
                 self.dropped = self.dropped.saturating_add(1);
                 continue;
             }
-            match self.transactions.entry(*signature(&tx, self.allocator)) {
+            let Some(sig) = signature(&tx, self.allocator) else {
+                // Unparsable; the validator would reject it anyway
+                tx.free(self.allocator);
+                self.dropped = self.dropped.saturating_add(1);
+                continue;
+            };
+            match self.transactions.entry(sig) {
                 // the old tx may be inflight, so free the new copy
                 Entry::Occupied(_) => tx.free(self.allocator),
                 Entry::Vacant(v) => _ = v.insert(tx),
@@ -134,7 +140,10 @@ impl<'a> Storage<'a> {
                         let responses: &[CheckResponse] = message.responses.slice(self.allocator);
                         for (tx, response) in txs.iter().zip(responses) {
                             if check_failed(response) {
-                                self.remove(signature(tx, self.allocator));
+                                self.remove(
+                                    &signature(tx, self.allocator)
+                                        .expect("stored transaction should have a signature"),
+                                );
                             }
                             response.free(self.allocator);
                         }

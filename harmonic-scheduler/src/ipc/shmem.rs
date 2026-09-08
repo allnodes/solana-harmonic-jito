@@ -22,6 +22,7 @@ use agave_scheduler_bindings::{
     SharableTransactionBatchRegion, SharableTransactionRegion, TransactionResponseRegion,
     WorkerToPackMessage, processed_codes,
 };
+use agave_transaction_view::transaction_view::UnsanitizedTransactionView;
 use rts_alloc::Allocator;
 use solana_pubkey::Pubkey;
 use std::mem::size_of;
@@ -52,11 +53,15 @@ pub trait Slice<T> {
     fn slice<'a>(&self, alloc: &'a Allocator) -> &'a [T];
 }
 
-/// Borrow the first signature (64 bytes after the leading length byte) from a transaction
-pub fn signature<'a>(tx: &SharableTransactionRegion, alloc: &'a Allocator) -> &'a [u8; 64] {
-    tx.slice(alloc)[1..65]
-        .try_into()
-        .expect("transaction should have at least one signature")
+/// Copy the first signature out of a serialized transaction
+///
+/// Parses the frame, so the signature is found wherever the version puts it
+/// (leading for legacy/v0, trailing for v1). Returns `None` if the bytes do not
+/// parse as a transaction
+pub fn signature(tx: &SharableTransactionRegion, alloc: &Allocator) -> Option<[u8; 64]> {
+    let bytes: &[u8] = tx.slice(alloc);
+    let view = UnsanitizedTransactionView::try_new_unsanitized(bytes).ok()?;
+    view.signatures().first()?.as_ref().try_into().ok()
 }
 
 /// Allocate a SharableTransactionRegion and copy `data` into it
