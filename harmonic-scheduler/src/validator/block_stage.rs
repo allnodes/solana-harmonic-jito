@@ -325,10 +325,12 @@ impl<'a> BlockStage<'a> {
             return;
         }
         let batch = allocate_batch(txs, self.allocator);
-        let entry = match self
-            .tasks
-            .entry(*signature(&batch.slice(self.allocator)[0], self.allocator))
-        {
+        let Some(key) = signature(&batch.slice(self.allocator)[0], self.allocator) else {
+            // A malformed member invalidates the whole atomic bundle.
+            batch.free_full(self.allocator);
+            return;
+        };
+        let entry = match self.tasks.entry(key) {
             // The old copy may be inflight, so free the new bundle.
             Entry::Occupied(_) => {
                 batch.free_full(self.allocator);
@@ -562,7 +564,8 @@ impl<'a> BlockStage<'a> {
         }
 
         // The batch is keyed by its first member's signature.
-        let key = *signature(&txs[0], self.allocator);
+        let key = signature(&txs[0], self.allocator)
+            .expect("executed transaction should have a signature");
         let task = self.tasks.get_mut(&key).expect("task should exist");
         task.state = TaskState::Done;
         self.running.unlock(task);
@@ -668,6 +671,10 @@ impl<'a> BlockStage<'a> {
 /// Parse the requested compute-unit limit
 fn compute_unit_limit(view: &UnsanitizedTransactionView<&[u8]>) -> u32 {
     const DEFAULT_CU: u32 = 200_000;
+    // v1 carries the limit in its transaction config; the runtime treats unset as 0
+    if let Some(config) = view.transaction_config() {
+        return config.compute_unit_limit().unwrap_or(0);
+    }
     let keys = view.static_account_keys();
     for ix in view.instructions_iter() {
         if keys.get(ix.program_id_index as usize) != Some(&compute_budget::ID) {
@@ -820,7 +827,7 @@ mod tests {
                 tx.sync();
                 if let Some(message) = rx.try_read() {
                     for tx in message.batch.slice(&allocator) {
-                        processed.push(*signature(tx, &allocator));
+                        processed.push(signature(tx, &allocator).unwrap());
                     }
                     let n = message.batch.num_transactions;
                     let bytes = u32::try_from(n as usize * size_of::<ExecutionResponse>()).unwrap();
