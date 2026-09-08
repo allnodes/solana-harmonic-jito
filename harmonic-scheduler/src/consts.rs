@@ -4,7 +4,6 @@ use agave_scheduler_bindings::{
     MAX_ALLOCATION_SIZE, MAX_TRANSACTIONS_PER_MESSAGE, SharableTransactionRegion,
 };
 use agave_scheduling_utils::handshake::MAX_WORKERS;
-use solana_packet::PACKET_DATA_SIZE;
 
 /// Standardized queue pull/dispatch size per tick
 pub const BATCH_SIZE: usize = MAX_TRANSACTIONS_PER_MESSAGE;
@@ -44,7 +43,8 @@ const GLOBAL_ALLOCATORS: usize = 1;
 /// Worst-case allocator-ID count under protocol caps
 const MAX_ALLOCATOR_IDS: usize = GLOBAL_ALLOCATORS + MAX_WORKERS + NUM_ALLOCATOR_HANDLES;
 /// rts-alloc max slot size for `SharableTransactionRegion`.
-const TX_SLOT_SIZE: usize = PACKET_DATA_SIZE.next_power_of_two();
+/// v1 (SIMD-0385) transactions may be up to 4096 bytes, which `MAX_ALLOCATION_SIZE` matches.
+const TX_SLOT_SIZE: usize = (MAX_ALLOCATION_SIZE as usize).next_power_of_two();
 /// rts-alloc max slot size for `SharableTransactionBatchRegion`.
 const BATCH_SLOT_SIZE: usize =
     (MAX_TRANSACTIONS_PER_MESSAGE * size_of::<SharableTransactionRegion>()).next_power_of_two();
