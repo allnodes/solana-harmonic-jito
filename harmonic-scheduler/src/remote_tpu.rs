@@ -5,13 +5,14 @@ use crate::auth::{
     self, AuthInterceptor, AuthSession, GRPC_CONNECTION_BACKOFF, MAX_GRPC_MESSAGE_SIZE,
 };
 use crate::config::RemoteTpuConfig;
+use crate::ipc::shmem::is_valid_tx_len;
 use crate::state::remote_tpu_active;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use log::{error, info, trace, warn};
 use solana_keypair::Keypair;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use subscribe_packets_response::Msg;
@@ -25,6 +26,7 @@ use validator_protos::relayer::{
     GetTpuConfigsRequest, SubscribePacketsRequest, SubscribePacketsResponse,
     subscribe_packets_response,
 };
+use validator_protos::shared::Socket;
 
 /// Timeout between remote TPU messages before assuming disconnect
 /// The remote TPU sends a heartbeat every 300ms
@@ -94,20 +96,13 @@ async fn connect(
         .get_tpu_configs(GetTpuConfigsRequest {})
         .await?
         .into_inner();
-    // Relayers report the UDP TPU port; QUIC lives at port+6 on the same host
-    let tpu_quic = response.tpu.map(|socket| {
-        let ip = socket.ip.parse().expect("tpu ip should parse");
-        let port: u16 = socket.port.try_into().expect("tpu port should fit u16");
-        SocketAddr::new(ip, port.saturating_add(6))
-    });
-    let tpu_forwards_quic = response.tpu_forward.map(|socket| {
-        let ip = socket.ip.parse().expect("tpu_forward ip should parse");
-        let port: u16 = socket
-            .port
-            .try_into()
-            .expect("tpu_forward port should fit u16");
-        SocketAddr::new(ip, port.saturating_add(6))
-    });
+    // Relayers report the UDP TPU port; QUIC lives at port+6 on the same host.
+    // A malformed address fails the connect and we retry after backoff
+    let tpu_quic = response.tpu.map(|s| quic_addr(s, "tpu")).transpose()?;
+    let tpu_forwards_quic = response
+        .tpu_forward
+        .map(|s| quic_addr(s, "tpu_forward"))
+        .transpose()?;
     info!("tpu_quic={tpu_quic:?}, tpu_forwards_quic={tpu_forwards_quic:?}");
     let tpu_config = TpuConfig {
         tpu_quic,
@@ -124,12 +119,24 @@ async fn connect(
     Ok((session, tpu_config, packet_stream))
 }
 
+/// Convert a relayer-reported UDP socket into its QUIC address (port+6)
+fn quic_addr(socket: Socket, what: &str) -> Result<SocketAddr> {
+    let ip: IpAddr = socket
+        .ip
+        .parse()
+        .with_context(|| format!("invalid {what} ip '{}'", socket.ip))?;
+    let port = u16::try_from(socket.port)
+        .with_context(|| format!("invalid {what} port {}", socket.port))?;
+    Ok(SocketAddr::new(ip, port.saturating_add(6)))
+}
+
 /// Forward packets from the relayer into `packet_tx`
 async fn forward_packets(
     stream: &mut Streaming<SubscribePacketsResponse>,
     packet_tx: &mut rtrb::Producer<Bytes>,
 ) -> Result<()> {
     let mut dropped: usize = 0;
+    let mut invalid: usize = 0;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -142,7 +149,19 @@ async fn forward_packets(
                             dropped = dropped.saturating_add(batch.packets.len());
                             continue;
                         };
-                        chunk.fill_from_iter(batch.packets.into_iter().map(|packet| packet.data));
+                        // Skip packets the SHM allocator cannot hold; `fill_from_iter`
+                        // commits only the items actually written
+                        chunk.fill_from_iter(
+                            batch
+                                .packets
+                                .into_iter()
+                                .map(|packet| packet.data)
+                                .filter(|data| {
+                                    let ok = is_valid_tx_len(data);
+                                    invalid += usize::from(!ok);
+                                    ok
+                                }),
+                        );
                     }
                     Some(Msg::Heartbeat(_)) => trace!("received heartbeat"),
                     None => trace!("received empty message"),
@@ -155,6 +174,10 @@ async fn forward_packets(
                 if dropped != 0 {
                     warn!("dropping packets: dropped={dropped}");
                     dropped = 0;
+                }
+                if invalid != 0 {
+                    warn!("ignored packets with invalid length: invalid={invalid}");
+                    invalid = 0;
                 }
             }
         }
