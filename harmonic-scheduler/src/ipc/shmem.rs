@@ -64,6 +64,14 @@ pub fn signature(tx: &SharableTransactionRegion, alloc: &Allocator) -> Option<[u
     view.signatures().first()?.as_ref().try_into().ok()
 }
 
+/// Whether `data` can be stored in a `SharableTransactionRegion`
+///
+/// Network ingress (remote TPU, block engine) must filter with this before
+/// handing bytes to [`allocate`], which asserts the same bounds
+pub fn is_valid_tx_len(data: &[u8]) -> bool {
+    !data.is_empty() && data.len() <= MAX_ALLOCATION_SIZE as usize
+}
+
 /// Allocate a SharableTransactionRegion and copy `data` into it
 /// Caller owns the returned allocation
 pub fn allocate(data: impl AsRef<[u8]>, alloc: &Allocator) -> SharableTransactionRegion {
