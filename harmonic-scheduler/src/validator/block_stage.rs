@@ -345,7 +345,7 @@ impl<'a> BlockStage<'a> {
         let mut checks: SmallVec<[Check; 4]> = SmallVec::new();
         let mut cu: u32 = 0;
 
-        for (i, &tx) in batch.slice(self.allocator).iter().enumerate() {
+        for &tx in batch.slice(self.allocator).iter() {
             let view =
                 match UnsanitizedTransactionView::try_new_unsanitized(tx.slice(self.allocator)) {
                     Ok(view) => view,
@@ -356,12 +356,9 @@ impl<'a> BlockStage<'a> {
                         return;
                     }
                 };
-            if i == 0 {
-                // Single-member fast path: a valid tx has unique account keys.
-                accounts = static_accounts(&view);
-            } else {
-                union_extend(&mut accounts, static_accounts(&view).into_iter());
-            }
+            // Always dedup: an invalid tx may repeat a key, and a duplicate
+            // would desync `AccountLocks` lock/unlock for the rest of the slot.
+            union_extend(&mut accounts, static_accounts(&view).into_iter());
             cu = cu.saturating_add(if is_vote {
                 Self::VOTE_CUS
             } else {
@@ -630,12 +627,9 @@ impl<'a> BlockStage<'a> {
                         .iter()
                         .enumerate()
                         .map(|(i, k)| (*k, i < alt_writable));
-                    if task.batch.num_transactions == 1 {
-                        // Singleton: a valid tx's static + ALT keys are unique.
-                        task.accounts.extend(keys);
-                    } else {
-                        union_extend(&mut task.accounts, keys);
-                    }
+                    // Always dedup: resolved ALT keys may collide with static
+                    // keys in an invalid tx.
+                    union_extend(&mut task.accounts, keys);
                 }
                 result.resolved_pubkeys.free(self.allocator);
             } else if task.state != TaskState::Dropped {

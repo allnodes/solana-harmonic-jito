@@ -4,6 +4,7 @@ use crate::auth::{
     self, AuthInterceptor, AuthSession, GRPC_CONNECTION_BACKOFF, MAX_GRPC_MESSAGE_SIZE,
 };
 use crate::config::BlockEngineConfig;
+use crate::ipc::shmem::is_valid_tx_len;
 use crate::state::block_engine_active;
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -179,8 +180,33 @@ async fn forward_blocks(
                         .into_iter()
                         .filter_map(|b| b.bundle.map(|bundle| (b.uuid, bundle)))
                     {
-                        let slot = uuid.parse::<u64>().expect("block uuid should be a valid slot");
-                        let txs: Vec<Bytes> = bundle.packets.into_iter().map(|p| p.data).collect();
+                        let slot = match uuid.parse::<u64>() {
+                            Ok(slot) => slot,
+                            Err(e) => {
+                                warn!("ignoring block with invalid slot '{uuid}': {e}");
+                                continue;
+                            }
+                        };
+                        // Bundles are atomic: bail on the first transaction the
+                        // SHM allocator cannot hold
+                        let txs: Result<Vec<Bytes>, usize> = bundle
+                            .packets
+                            .into_iter()
+                            .map(|p| {
+                                if is_valid_tx_len(&p.data) {
+                                    Ok(p.data)
+                                } else {
+                                    Err(p.data.len())
+                                }
+                            })
+                            .collect();
+                        let txs = match txs {
+                            Ok(txs) => txs,
+                            Err(len) => {
+                                warn!("dropping bundle with invalid transaction length: slot={slot} len={len}");
+                                continue;
+                            }
+                        };
                         let n = txs.len();
                         trace!("received {n} transactions: slot={slot}");
                         if block_tx.push((slot, txs)).is_err() {
