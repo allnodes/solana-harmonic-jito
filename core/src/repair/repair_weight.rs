@@ -853,7 +853,7 @@ impl RepairWeight {
                 .min()
                 .expect("Pruned tree cannot be empty");
             let duplicate_confirmed_threshold =
-                ((min_total_stake as f64) * DUPLICATE_THRESHOLD) as u64;
+                ((min_total_stake as f64) * *DUPLICATE_THRESHOLD) as u64;
 
             // TODO: `HeaviestSubtreeForkChoice` subtracts and migrates stake as validators switch
             // forks within the rooted subtree, however `repair_weight` does not migrate stake
