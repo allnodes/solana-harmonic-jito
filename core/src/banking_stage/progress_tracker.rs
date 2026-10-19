@@ -23,7 +23,9 @@ use {
     },
 };
 
-const ALPENGLOW_PROGRESS_SPIN_DURATION: Duration = Duration::from_millis(1);
+const ALPENGLOW_PROGRESS_SPIN_DURATION: Duration = Duration::from_micros(100);
+/// longest wait between progress checks under alpenglow.
+const ALPENGLOW_PROGRESS_MAX_WAIT: Duration = Duration::from_millis(1);
 
 /// Spawns a thread to track and send progress updates.
 pub fn spawn(
@@ -134,6 +136,9 @@ impl ProgressTracker {
             std::thread::yield_now();
             return;
         };
+        // The next bank is installed just after the current bank's last progress boundary, so
+        // sleeping to the following boundary would report its start up to a full step late.
+        let deadline = deadline.min(Instant::now() + ALPENGLOW_PROGRESS_MAX_WAIT);
 
         let sleep_until = deadline
             .checked_sub(ALPENGLOW_PROGRESS_SPIN_DURATION)
